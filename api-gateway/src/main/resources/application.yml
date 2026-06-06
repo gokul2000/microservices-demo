@@ -1,0 +1,7 @@
+spring:
+  application:
+    name: api-gateway
+  config:
+    # Pull the rest of this service's config (routes, port, eureka) from the
+    # config server. "optional:" means the app still starts if config is down.
+    import: optional:configserver:http://localhost:8888

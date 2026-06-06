@@ -1,0 +1,28 @@
+server:
+  port: 8888
+
+spring:
+  application:
+    name: config-server
+  profiles:
+    # "native" = serve config from the local filesystem/classpath instead of Git.
+    # Keeps this demo self-contained. Swap to a Git backend for production.
+    active: native
+  cloud:
+    config:
+      server:
+        native:
+          # Property files for every service live here, on the classpath.
+          search-locations: classpath:/config-repo
+
+# The config server itself registers with Eureka so clients can discover it.
+eureka:
+  client:
+    service-url:
+      defaultZone: http://localhost:8761/eureka/
+
+management:
+  endpoints:
+    web:
+      exposure:
+        include: health, info

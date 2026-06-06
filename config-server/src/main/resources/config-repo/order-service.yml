@@ -1,0 +1,50 @@
+server:
+  port: 8083
+
+spring:
+  datasource:
+    url: jdbc:h2:mem:orderdb
+    driver-class-name: org.h2.Driver
+    username: sa
+    password: ""
+  jpa:
+    hibernate:
+      ddl-auto: update
+    show-sql: true
+  h2:
+    console:
+      enabled: true
+
+# --- Resilience4j: circuit breaker + retry around the inventory call ---------
+resilience4j:
+  circuitbreaker:
+    instances:
+      inventory:
+        register-health-indicator: true          # surface state via /actuator/health
+        sliding-window-type: COUNT_BASED
+        sliding-window-size: 10                   # judge over the last 10 calls
+        minimum-number-of-calls: 5                # ...but only after at least 5
+        failure-rate-threshold: 50                # open if >=50% of them fail
+        wait-duration-in-open-state: 10s          # stay OPEN this long, then probe
+        permitted-number-of-calls-in-half-open-state: 3
+        automatic-transition-from-open-to-half-open-enabled: true
+  retry:
+    instances:
+      inventory:
+        max-attempts: 3                           # 1 try + 2 retries
+        wait-duration: 1s
+        # Don't retry on a 4xx (e.g. client error); those won't fix themselves.
+        retry-exceptions:
+          - java.io.IOException
+          - java.util.concurrent.TimeoutException
+          - feign.RetryableException
+
+# Expose the circuit-breaker state so you can watch it open/close.
+management:
+  endpoints:
+    web:
+      exposure:
+        include: health, info, metrics, circuitbreakers, circuitbreakerevents
+  health:
+    circuitbreakers:
+      enabled: true
