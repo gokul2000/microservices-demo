@@ -1,0 +1,96 @@
+// =============================================================================
+//  E-Commerce Microservices — Spring Cloud Demo
+//  Eraser DSL (cloud architecture diagram)
+//  Paste into https://app.eraser.io  ->  "Diagram as code"
+//
+//  Reads the whole project at a glance:
+//   - what each module is and the port it runs on
+//   - how services find each other (Eureka), get config (Config Server),
+//     and are reached from outside (API Gateway)
+//   - the order -> inventory call path (OpenFeign + Resilience4j) that drives
+//     the distributed Saga
+//   - the data each service owns (H2 in-memory, one DB per service)
+// =============================================================================
+
+title E-Commerce Microservices (Spring Cloud)
+
+direction down
+
+// ---- Caller --------------------------------------------------------------
+Client [icon: monitor, label: "Client / curl"]
+
+// ---- Platform / infrastructure services ----------------------------------
+Platform [icon: settings, color: blue] {
+  Discovery [icon: aws-cloud-map, label: "Discovery Server\nEureka  :8761"]
+  Config [icon: aws-systems-manager, label: "Config Server\nnative profile  :8888"]
+  ConfigRepo [icon: folder, label: "config-repo/\napplication.yml + <service>.yml"]
+}
+
+// ---- Edge ----------------------------------------------------------------
+Gateway [icon: aws-api-gateway, color: orange, label: "API Gateway\nSpring Cloud Gateway  :8080\nlb:// path routing"]
+
+// ---- Business services + their data --------------------------------------
+Product [icon: aws-elastic-container-service, color: green] {
+  ProductSvc [icon: java, label: "product-service\ncatalog CRUD  :8081"]
+  ProductDB [icon: database, label: "H2 productdb\nProduct(id, name, price, skuCode)"]
+}
+
+Inventory [icon: aws-elastic-container-service, color: green] {
+  InventorySvc [icon: java, label: "inventory-service\nstock + reservations  :8082"]
+  InventoryDB [icon: database, label: "H2 inventorydb\nInventory(skuCode, qty)\nReservation(id, sku, qty, status)"]
+}
+
+Order [icon: aws-elastic-container-service, color: green] {
+  OrderSvc [icon: java, label: "order-service\nSaga orchestrator  :8083"]
+  OrderSaga [icon: refresh-cw, label: "OrderSaga\nreserve -> create -> confirm\n(LIFO compensations)"]
+  InvGateway [icon: shield, color: red, label: "InventoryGateway\nResilience4j\n@Retry + @CircuitBreaker"]
+  InvClient [icon: link, label: "InventoryClient\n@FeignClient(inventory-service)"]
+  OrderDB [icon: database, label: "H2 orderdb\nOrder(id, orderNumber, sku,\nqty, status, reservationId)"]
+}
+
+// ---- External request routing (through the gateway) ----------------------
+Client > Gateway: "REST /api/**"
+Gateway > ProductSvc: "Path=/api/products/** -> lb://product-service"
+Gateway > InventorySvc: "Path=/api/inventory/** -> lb://inventory-service"
+Gateway > OrderSvc: "Path=/api/orders/** -> lb://order-service"
+
+// ---- Service discovery: everyone registers with Eureka -------------------
+Gateway > Discovery: "register / discover"
+ProductSvc > Discovery: "register"
+InventorySvc > Discovery: "register"
+OrderSvc > Discovery: "register"
+Config > Discovery: "register"
+
+// ---- Centralized config: pulled at boot ----------------------------------
+Config > ConfigRepo: "serves *.yml (native)"
+Gateway > Config: "fetch config @boot"
+ProductSvc > Config: "fetch config @boot"
+InventorySvc > Config: "fetch config @boot"
+OrderSvc > Config: "fetch config @boot"
+
+// ---- The order Saga: order -> inventory (load-balanced, resilient) -------
+OrderSvc > OrderSaga: "POST /api/orders"
+OrderSaga > InvGateway: "reserveStock / releaseStock"
+InvGateway > InvClient: "guarded call"
+InvClient > InventorySvc: "lb:// Feign\nreserve / release / isInStock"
+
+// ---- Data ownership (DB-per-service) -------------------------------------
+ProductSvc > ProductDB
+InventorySvc > InventoryDB
+OrderSvc > OrderDB
+OrderSaga > OrderDB: "PENDING -> CONFIRMED / CANCELLED"
+
+// =============================================================================
+//  SAGA FLOW (happy path -> CONFIRMED;  failure -> compensated, eventual consistency)
+//    1. reserve inventory   (remote, inventory-service)  | undo: release reservation
+//    2. create order PENDING (local, order-service)       | undo: mark CANCELLED
+//    3. confirm order        (local; "simulateFailure")   | last step, no undo
+//  On any failure: compensations run newest-first (LIFO), idempotent release.
+//
+//  CIRCUIT BREAKER (Resilience4j on the inventory call):
+//    sliding window 10, min 5 calls, open at >=50% failures, 10s open then half-open.
+//    Only 5xx/timeouts/connection-refused count; "insufficient stock" = normal 200.
+//
+//  NOTE: payment-service is intentionally omitted; it would slot in as a saga
+//        step between create and confirm, with refund as its compensation.
+// =============================================================================
