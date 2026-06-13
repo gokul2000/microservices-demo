@@ -3,6 +3,7 @@ package com.ecommerce.order.service;
 import com.ecommerce.order.client.InventoryClient;
 import com.ecommerce.order.client.ReserveRequest;
 import com.ecommerce.order.client.ReserveResponse;
+import io.github.resilience4j.bulkhead.annotation.Bulkhead;
 import io.github.resilience4j.circuitbreaker.annotation.CircuitBreaker;
 import io.github.resilience4j.retry.annotation.Retry;
 import lombok.RequiredArgsConstructor;
@@ -21,11 +22,23 @@ import static org.springframework.http.HttpStatus.SERVICE_UNAVAILABLE;
  * silently never runs. Injecting this gateway into the saga makes calls cross
  * the proxy boundary, so the aspects apply.
  *
- * Both saga operations are guarded:
+ * Both saga operations are guarded by three Resilience4j aspects. Resilience4j
+ * applies them in a fixed default order, OUTERMOST first:
+ *
+ *     Retry  ->  CircuitBreaker  ->  Bulkhead  ->  actual remote call
+ *
  *   - @Retry          a few attempts for transient failures, then give up.
  *   - @CircuitBreaker once the failure rate crosses the threshold the breaker
  *                     OPENS and short-circuits to the fallback for a cooldown
  *                     window, so we stop hammering a service that's already down.
+ *   - @Bulkhead       caps how many calls may be IN-FLIGHT to inventory-service
+ *                     at once (a semaphore). The (N+1)th concurrent caller is
+ *                     rejected instantly instead of piling up a blocked thread,
+ *                     so one slow dependency can't drain the whole thread pool.
+ *
+ * Because the breaker sits OUTSIDE the bulkhead, an OPEN circuit short-circuits
+ * before a permit is ever taken; because it sits INSIDE retry, retried attempts
+ * against a dead service hit the open breaker and fail fast instead of storming.
  */
 @Slf4j
 @Component
@@ -38,6 +51,7 @@ public class InventoryGateway {
 
     @Retry(name = "inventory")
     @CircuitBreaker(name = "inventory", fallbackMethod = "reserveFallback")
+    @Bulkhead(name = "inventory")
     public ReserveResponse reserveStock(String skuCode, int quantity) {
         return inventoryClient.reserve(new ReserveRequest(skuCode, quantity));
     }
@@ -53,6 +67,7 @@ public class InventoryGateway {
 
     @Retry(name = "inventory")
     @CircuitBreaker(name = "inventory", fallbackMethod = "releaseFallback")
+    @Bulkhead(name = "inventory")
     public void releaseStock(Long reservationId) {
         inventoryClient.release(reservationId);
     }

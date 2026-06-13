@@ -45,7 +45,7 @@ Clients ──► API Gateway :8080 ──► /api/products  ──► product-s
 | **API Gateway** | `api-gateway` | Spring Cloud **Gateway**. Single entry point; path-based routing to services via `lb://` (Eureka-aware load balancing). |
 | **Declarative inter-service calls** | `order-service` | **OpenFeign** client (`InventoryClient`) calls inventory-service by its Eureka name, load-balanced automatically. |
 | **Client-side load balancing** | (all clients) | Spring Cloud **LoadBalancer** resolves `lb://service-name` and Feign names to live instances. |
-| **Circuit Breaker + Retry** | `order-service` | **Resilience4j** guards the inventory calls (`InventoryGateway`). Opens the circuit when inventory-service fails, short-circuits to a fallback (HTTP 503) instead of cascading. |
+| **Circuit Breaker + Retry + Bulkhead** | `order-service` | **Resilience4j** guards the inventory calls (`InventoryGateway`) with three stacked aspects: **Retry** (transient blips) → **Circuit Breaker** (opens on sustained failure, short-circuits to a 503 fallback instead of cascading) → **Bulkhead** (caps concurrent in-flight calls so a slow dependency can't drain the thread pool). |
 | **Saga + compensating rollback** | `order-service` (orchestrator) + `inventory-service` (participant) | `OrderSaga` runs a multi-step distributed transaction (reserve → create → confirm). If a step fails, it undoes the completed steps in reverse via compensations (release reservation, cancel order). |
 | **Business services** | `product-`, `inventory-`, `order-service` | Plain Spring Boot + JPA (H2 in-memory) services that own their own data. |
 
@@ -65,13 +65,15 @@ Clients ──► API Gateway :8080 ──► /api/products  ──► product-s
 - At boot the service downloads `application.yml` (shared) + `<its-name>.yml`
   (specific) from the config server — that's where its port and datasource come from.
 
-### How the circuit breaker works here
+### How the resilience layer works here
 The order → inventory call is the one network hop that can fail, so it's wrapped
-with **Resilience4j** in `InventoryGateway` (its own bean — see the note below):
+with **three stacked Resilience4j aspects** in `InventoryGateway` (its own bean —
+see the note below):
 
 ```java
 @Retry(name = "inventory")
 @CircuitBreaker(name = "inventory", fallbackMethod = "reserveFallback")
+@Bulkhead(name = "inventory")
 public ReserveResponse reserveStock(String skuCode, int quantity) {
     return inventoryClient.reserve(new ReserveRequest(skuCode, quantity));  // remote call
 }
@@ -81,12 +83,30 @@ private ReserveResponse reserveFallback(String skuCode, int quantity, Throwable 
 }
 ```
 
-- **Retry**: a couple of attempts for transient blips before giving up.
+Resilience4j applies the aspects in a **fixed default order, outermost first**:
+
+```
+Retry  ─►  CircuitBreaker  ─►  Bulkhead  ─►  actual remote call
+```
+
+- **Retry** (outermost): a couple of attempts for transient blips before giving up.
 - **Circuit breaker**: counts failures over a sliding window
   (`config-repo/order-service.yml`). At ≥50% failures over the last 10 calls it
   **opens** for 10s, short-circuiting straight to the fallback so order-service
   stops hammering a dead inventory-service. After 10s it goes **half-open**,
   lets a few probe calls through, and **closes** again if they succeed.
+- **Bulkhead** (innermost): a **semaphore** allowing at most `max-concurrent-calls`
+  (10) calls in flight to inventory-service at once; `max-wait-duration: 0` means
+  the 11th concurrent caller is **rejected instantly** rather than blocking on a
+  thread. This is the *isolation* layer — if inventory-service goes slow, callers
+  fail fast instead of every order-service thread piling up on it.
+- **Why this order matters.** The breaker sits **outside** the bulkhead, so an
+  **open** circuit short-circuits *before* a permit is taken — no bulkhead pressure
+  while the service is known-down. The breaker sits **inside** retry, so retried
+  attempts against a dead service hit the open breaker and **fail fast** instead of
+  storming the network. (Note: a `BulkheadFullException` propagates outward and is
+  recorded by the breaker; for a teaching demo that's fine, in production you'd
+  typically ignore load-shedding rejections in the breaker's failure count.)
 - **Why a separate bean?** Resilience4j works via Spring AOP proxies, which only
   intercept calls coming from *outside* the bean. If `reserveStock` lived on
   `OrderSaga` and were called by another `OrderSaga` method, that self-invocation
@@ -281,8 +301,10 @@ the stock is fully restored — the distributed equivalent of a transaction roll
 - Make the saga **choreography-based** instead of orchestration-based: services
   publish events (Kafka/RabbitMQ) and react, rather than order-service calling
   each one. Removes the central coordinator at the cost of harder traceability.
-- Add a **TimeLimiter** + bulkhead to the inventory calls (needs an async/reactive
-  return type), complementing the circuit breaker that's already in place.
+- Add a **TimeLimiter** (per-attempt timeout) to the inventory calls to round out
+  the resilience stack. Unlike the semaphore **Bulkhead** that's already in place,
+  the TimeLimiter needs an **async/reactive return type** (`CompletableFuture` /
+  `Mono`), so it requires reworking `InventoryGateway` to return a future.
 - Swap the config `native` backend for a **Git** repo.
 - Add **distributed tracing** (Micrometer + Zipkin) to follow a request across
   services.

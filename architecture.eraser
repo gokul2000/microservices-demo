@@ -7,7 +7,8 @@
 //   - what each module is and the port it runs on
 //   - how services find each other (Eureka), get config (Config Server),
 //     and are reached from outside (API Gateway)
-//   - the order -> inventory call path (OpenFeign + Resilience4j) that drives
+//   - the order -> inventory call path (OpenFeign + Resilience4j: Retry +
+//     CircuitBreaker + Bulkhead) that drives
 //     the distributed Saga
 //   - the data each service owns (H2 in-memory, one DB per service)
 // =============================================================================
@@ -43,7 +44,7 @@ Inventory [icon: aws-elastic-container-service, color: green] {
 Order [icon: aws-elastic-container-service, color: green] {
   OrderSvc [icon: java, label: "order-service\nSaga orchestrator  :8083"]
   OrderSaga [icon: refresh-cw, label: "OrderSaga\nreserve -> create -> confirm\n(LIFO compensations)"]
-  InvGateway [icon: shield, color: red, label: "InventoryGateway\nResilience4j\n@Retry + @CircuitBreaker"]
+  InvGateway [icon: shield, color: red, label: "InventoryGateway\nResilience4j\n@Retry + @CircuitBreaker + @Bulkhead"]
   InvClient [icon: link, label: "InventoryClient\n@FeignClient(inventory-service)"]
   OrderDB [icon: database, label: "H2 orderdb\nOrder(id, orderNumber, sku,\nqty, status, reservationId)"]
 }
@@ -87,9 +88,13 @@ OrderSaga > OrderDB: "PENDING -> CONFIRMED / CANCELLED"
 //    3. confirm order        (local; "simulateFailure")   | last step, no undo
 //  On any failure: compensations run newest-first (LIFO), idempotent release.
 //
-//  CIRCUIT BREAKER (Resilience4j on the inventory call):
-//    sliding window 10, min 5 calls, open at >=50% failures, 10s open then half-open.
-//    Only 5xx/timeouts/connection-refused count; "insufficient stock" = normal 200.
+//  RESILIENCE STACK (Resilience4j on the inventory call), applied outermost-first:
+//    Retry -> CircuitBreaker -> Bulkhead -> remote call
+//    - Retry:          3 attempts, 1s apart, only on IO/timeout/retryable (not 4xx).
+//    - CircuitBreaker: sliding window 10, min 5 calls, open at >=50% failures,
+//                      10s open then half-open. "insufficient stock" = normal 200.
+//    - Bulkhead:       semaphore, max 10 concurrent in-flight calls, 11th rejected
+//                      instantly (max-wait 0) -> isolation, no thread pile-up.
 //
 //  NOTE: payment-service is intentionally omitted; it would slot in as a saga
 //        step between create and confirm, with refund as its compensation.

@@ -15,7 +15,7 @@ spring:
     console:
       enabled: true
 
-# --- Resilience4j: circuit breaker + retry around the inventory call ---------
+# --- Resilience4j: circuit breaker + retry + bulkhead around the inventory call
 resilience4j:
   circuitbreaker:
     instances:
@@ -28,6 +28,14 @@ resilience4j:
         wait-duration-in-open-state: 10s          # stay OPEN this long, then probe
         permitted-number-of-calls-in-half-open-state: 3
         automatic-transition-from-open-to-half-open-enabled: true
+  # Semaphore bulkhead: caps CONCURRENT in-flight calls to inventory-service so a
+  # slow dependency can't tie up every order-service thread (isolation, fail-fast).
+  bulkhead:
+    instances:
+      inventory:
+        max-concurrent-calls: 10                  # at most 10 calls in flight at once
+        max-wait-duration: 0                      # 11th caller is rejected instantly,
+                                                  # it does NOT queue/block for a permit
   retry:
     instances:
       inventory:
